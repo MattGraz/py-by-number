@@ -153,7 +153,7 @@ def remove_single_pixels(image: Image) -> Image:
             neb_values = [tuple(i) for i in list(neb_dict.values())]
 
             if tuple(current_pixel_value) not in neb_values:
-                print(f"Replacing pixex {i} {j}")
+                print(f"Replacing pixel {i} {j}")
                 impute_pixel = Counter(neb_values).most_common()[0][0]
 
                 # Note that (j, i) is intentional as opposed to i, j as pillow as a different ordering convetion than numpy
