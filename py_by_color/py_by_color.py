@@ -269,19 +269,40 @@ def render_paint_by_number(
                 for y in y_pts:
                     pt = Point(x, y)
                     if geom.contains(pt):
-                        ax.text(x, y, label, ha="center", va="center",
-                                fontsize=font_size, color="black")
+                        ax.text(
+                            x,
+                            y,
+                            label,
+                            ha="center",
+                            va="center",
+                            fontsize=font_size,
+                            color="black",
+                        )
                         placed = True
             # Fallback if grid missed the shape (thin/odd geometry)
             if not placed:
                 rp = geom.representative_point()
-                ax.text(rp.x, rp.y, label, ha="center", va="center",
-                        fontsize=font_size, color="black")
+                ax.text(
+                    rp.x,
+                    rp.y,
+                    label,
+                    ha="center",
+                    va="center",
+                    fontsize=font_size,
+                    color="black",
+                )
         else:
             # Small polygon: single label
             rp = geom.representative_point()
-            ax.text(rp.x, rp.y, label, ha="center", va="center",
-                    fontsize=font_size, color="black")
+            ax.text(
+                rp.x,
+                rp.y,
+                label,
+                ha="center",
+                va="center",
+                fontsize=font_size,
+                color="black",
+            )
 
     ax.set_aspect("equal")
     ax.axis("off")
@@ -322,8 +343,9 @@ def main():
     )  # Helpful when there are very fine details; Can I programatically identify?
     pixel_to_color_dict = map_real_colors_to_available_colors(image, available_colors)
     image_adj = convert_image_to_available_colors(image, pixel_to_color_dict)
-    image_adj.save("image_adj.png")
+
     image_adj_new = remove_single_pixels(image_adj)
+    image_adj_new.save("image_adj.png")
     image_adj_gdf = convert_image_to_shapes(image_adj_new, available_colors)
     image_adj_gdf = clean_shapes(image_adj_gdf.copy())
 
