@@ -13,11 +13,9 @@ from rasterio.features import shapes
 from scipy.spatial.distance import euclidean
 from shapely.geometry import Polygon
 from sklearn.cluster import KMeans
-from sklearn.neighbors import KNeighborsClassifier
 from tqdm import tqdm
 
-from qgis.core import *
-from PyQt5.QtGui import QFont, QColor
+import matplotlib.pyplot as plt
 
 # AVAILABLE_COLORS = {
 #      1: [228, 23, 23],  # Red-ish,
@@ -61,7 +59,7 @@ def get_available_colors(image: Image, n_colors=15):
     pixels = list(image.getdata())
 
     # Cluster (Kmeans) pixels to identify "mean" color of each cluster
-    km = KMeans(n_clusters=n_colors, verbose=1, random_state=100, n_jobs=8)
+    km = KMeans(n_clusters=n_colors, verbose=1, random_state=100)
 
     km_fit = km.fit(pixels)
 
@@ -84,7 +82,12 @@ def map_real_colors_to_available_colors(image: Image, available_colors: Dict) ->
     for pixel_iter in tqdm(unique_pixel_colors):
         distances = []
         for avail_iter in available_colors.values():
-            distances.append(euclidean(pixel_iter, avail_iter,))
+            distances.append(
+                euclidean(
+                    pixel_iter,
+                    avail_iter,
+                )
+            )
         min_idx = np.where(distances == np.amin(distances))[0][0]
         pixel_to_color_dict[pixel_iter] = list(available_colors.values())[min_idx]
 
@@ -113,7 +116,6 @@ def get_neighbors_idx(i, j):
     neighbor_idx = []
 
     for i_adj, j_adj in idx_adj:
-
         if ((i + i_adj) < 0) or ((j + j_adj) < 0):
             continue
         else:
@@ -141,7 +143,6 @@ def remove_single_pixels(image: Image) -> Image:
     height = image_adj_array.shape[1]
     for i in tqdm(range(0, width)):  # process all pixels
         for j in range(0, height):
-
             current_pixel_value = image_adj_array[i][j]
 
             neb_dict = get_neighbor_values(image_adj_array, i, j)
@@ -203,14 +204,14 @@ def convert_image_to_shapes(image: Image, available_colors: Dict) -> gpd.GeoData
     return all_geo
 
 
-def clean_shapes(gdf, percentile_threshhold=.65, drop_duplicates=True):
+def clean_shapes(gdf, percentile_threshhold=0.65, drop_duplicates=True):
 
     # Drop shapes with area less than nth percentile; Removes lots of really small shapes
     nth_percentile = gdf.geometry.area.quantile(percentile_threshhold)
     gdf = gdf[gdf.geometry.area > nth_percentile]
-    
+
     # NOTE: buffer(0) is intentional, as this corrects invalid polygons
-    gdf['geometry'] = gdf['geometry'].buffer(0)
+    gdf["geometry"] = gdf["geometry"].buffer(0)
 
     if drop_duplicates:
         # Identify and Drop duplicate shapes (may have different colors)
@@ -224,7 +225,9 @@ def clean_shapes(gdf, percentile_threshhold=.65, drop_duplicates=True):
 
             if equal_shapes.shape[0] > 1:
                 print("Dropping")
-                gdf = gdf[~((gdf.geometry == shape_iter) & (gdf.color_index == color_iter))]
+                gdf = gdf[
+                    ~((gdf.geometry == shape_iter) & (gdf.color_index == color_iter))
+                ]
 
     return gdf
 
@@ -235,87 +238,80 @@ def smooth_image(image: Image, iter=3) -> Image:
     return image
 
 
-def read_layer(path: str, name: str="mygeo"):
+def render_paint_by_number(
+    gdf: gpd.GeoDataFrame, output_path: str = "paint_by_number.png", dpi: int = 200
+):
+    """Render shapes with color index labels at each polygon's centroid."""
+    fig, ax = plt.subplots(1, 1, figsize=(16, 12))
 
-    # Create new layer from geojson
-    vlayer = QgsVectorLayer(path, name)
-    if not vlayer.isValid():
-        print("Layer failed to load!")
+    # Draw all polygons with white fill and thin black outlines
+    gdf.plot(ax=ax, facecolor="white", edgecolor="black", linewidth=0.3)
 
-    # Print additional available attributes
-    for field in vlayer.fields():
-        print(field.name(), field.typeName())
+    # Place color_index labels inside each polygon
+    # For large shapes, scatter multiple labels so the number is always nearby
+    from shapely.geometry import Point
 
-    return vlayer 
+    label_spacing = 40  # pixels between repeated labels in large shapes
 
+    for _, row in gdf.iterrows():
+        geom = row.geometry
+        area = geom.area
+        label = str(row["color_index"])
+        font_size = max(2, min(6, area**0.3))
 
-def format_layer(layer):
+        if area > label_spacing * label_spacing:
+            # Large polygon: place labels on a grid within the shape
+            minx, miny, maxx, maxy = geom.bounds
+            x_pts = np.arange(minx + label_spacing / 2, maxx, label_spacing)
+            y_pts = np.arange(miny + label_spacing / 2, maxy, label_spacing)
+            placed = False
+            for x in x_pts:
+                for y in y_pts:
+                    pt = Point(x, y)
+                    if geom.contains(pt):
+                        ax.text(x, y, label, ha="center", va="center",
+                                fontsize=font_size, color="black")
+                        placed = True
+            # Fallback if grid missed the shape (thin/odd geometry)
+            if not placed:
+                rp = geom.representative_point()
+                ax.text(rp.x, rp.y, label, ha="center", va="center",
+                        fontsize=font_size, color="black")
+        else:
+            # Small polygon: single label
+            rp = geom.representative_point()
+            ax.text(rp.x, rp.y, label, ha="center", va="center",
+                    fontsize=font_size, color="black")
 
-    # layer = qgis.utils.iface.mapCanvas().currentLayer()
+    ax.set_aspect("equal")
+    ax.axis("off")
 
-    layer.startEditing()
-    registry = QgsSymbolLayerRegistry()
-    lineMeta = registry.symbolLayerMetadata("SimpleLine")
-    symbol = QgsSymbol.defaultSymbol(layer.geometryType())
+    # Flip y-axis since image coordinates have origin at top-left
+    ax.invert_yaxis()
 
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    print(f"Paint-by-number saved to {output_path}")
 
-    # Line layer
-    lineLayer = lineMeta.createSymbolLayer({'width': '0.05',  # mm
-                                            'color': '0, 0, 0',  # black
-                                            'offset': '0',
-                                            'penstyle': 'solid',
-                                            'use_custom_dash': '0',
-                                            'joinstyle': 'bevel',
-                                            'capstyle': 'square'})
-
-    # Replace the default layer with our two custom layers
-    symbol.deleteSymbolLayer(0)
-    symbol.appendSymbolLayer(lineLayer)
-    # symbol.appendSymbolLayer(markerLayer)
-
-    # Replace the renderer of the current layer
-    renderer = QgsSingleSymbolRenderer(symbol)
-    layer.setRenderer(renderer)
-
-    # Set labels to be the color index
-    layer_settings  = QgsPalLayerSettings()
-    text_format = QgsTextFormat()
-
-    text_format.setFont(QFont("Arial", 5))
-    text_format.setSize(5)
-
-    buffer_settings = QgsTextBufferSettings()
-    buffer_settings.setEnabled(True)
-    buffer_settings.setSize(0)
-    buffer_settings.setColor(QColor("gray"))
-
-    text_format.setBuffer(buffer_settings)
-    layer_settings.setFormat(text_format)
-
-    layer_settings.fieldName = "color_index"
-    layer_settings.placement = 2
-    layer_settings.enabled = True
-
-    layer_settings = QgsVectorLayerSimpleLabeling(layer_settings)
-    layer.setLabelsEnabled(True)
-    layer.setLabeling(layer_settings)
-    
-    layer.commitChanges()
-
-    return layer
-    
 
 def main():
-    
+
     # create parser
     parser = argparse.ArgumentParser()
-    
+
     # add arguments to the parser
-    
-    parser.add_argument('--input_path', help='Path to input file (jpg, png)')
-    parser.add_argument("--layer_name", default="picture_layer", help="Name of layer in qgis layer")
-    parser.add_argument('--output_path', default="data/output.qgs", help='Path to input file (jpg, png)')
-    
+
+    parser.add_argument("--input_path", help="Path to input file (jpg, png)")
+    parser.add_argument(
+        "--layer_name", default="picture_layer", help="Name of layer in qgis layer"
+    )
+    parser.add_argument(
+        "--output_path",
+        default="paint_by_number.png",
+        help="Path to output paint-by-number image (png, pdf)",
+    )
+
     # parse the arguments
     args = parser.parse_args()
 
@@ -326,35 +322,19 @@ def main():
     )  # Helpful when there are very fine details; Can I programatically identify?
     pixel_to_color_dict = map_real_colors_to_available_colors(image, available_colors)
     image_adj = convert_image_to_available_colors(image, pixel_to_color_dict)
+    image_adj.save("image_adj.png")
     image_adj_new = remove_single_pixels(image_adj)
     image_adj_gdf = convert_image_to_shapes(image_adj_new, available_colors)
     image_adj_gdf = clean_shapes(image_adj_gdf.copy())
 
     # Write to geojson
-    image_adj_gdf.reset_index(drop=True).to_file("test_geopandas.geojson", driver="GeoJSON")
+    image_adj_gdf.reset_index(drop=True).to_file(
+        "test_geopandas.geojson", driver="GeoJSON"
+    )
 
-    # Initialize QGIS Application 
-    # NOTE: The initialization MUST happen globally and not in a function or 
-    #   several things (reading shapes), (defining layouts) results in seg faults
-    gui_flag=False
-    qgs = QgsApplication([], gui_flag)
-    QgsApplication.setPrefixPath("/usr/local/Caskroom/miniconda/base/envs/qgis/bin/qgis", True)
-    QgsApplication.initQgis()
-    for alg in QgsApplication.processingRegistry().algorithms():
-        print(alg.id(), "->", alg.displayName())
+    # Render paint-by-number image with labeled shapes
+    render_paint_by_number(image_adj_gdf, args.output_path)
 
-    vlayer = read_layer("test_geopandas.geojson", "PleaseWork")
-    vlayer_adj = format_layer(vlayer)
-
-    project = QgsProject.instance()         
-    # manager = project.layoutManager()       
-    # layout = QgsPrintLayout(project)   
-    project.addMapLayer(vlayer_adj)
-    # exporter = QgsLayoutExporter(layout)                
-    # exporter.exportToPdf('hope_it_worked.pdf', QgsLayoutExporter.PdfExportSettings())      
-
-    # WRITE OUT A QGIS PROJECT FILE
-    project.write("WORK_PLEASE_new_label_again_again.qgs")
 
 if __name__ == "__main__":
     main()
