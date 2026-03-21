@@ -204,9 +204,9 @@ def convert_image_to_shapes(image: Image, available_colors: Dict) -> gpd.GeoData
     return all_geo
 
 
-def clean_shapes(gdf, percentile_threshhold=0.65, drop_duplicates=True):
+def clean_shapes(gdf, percentile_threshhold=0.05, drop_duplicates=True):
 
-    # Drop shapes with area less than nth percentile; Removes lots of really small shapes
+    # Drop shapes with area less than nth percentile; only removes pixel-level noise
     nth_percentile = gdf.geometry.area.quantile(percentile_threshhold)
     gdf = gdf[gdf.geometry.area > nth_percentile]
 
@@ -227,11 +227,126 @@ def clean_shapes(gdf, percentile_threshhold=0.65, drop_duplicates=True):
     # regions. Explode them back into individual parts so each part can be labeled.
     gdf = gdf.explode(index_parts=False).reset_index(drop=True)
 
-    # Drop any small fragments that appeared after dissolve+explode
-    nth_percentile = gdf.geometry.area.quantile(percentile_threshhold)
+    # Drop only genuine 1-pixel fragments after dissolve+explode
+    nth_percentile = gdf.geometry.area.quantile(0.02)
     gdf = gdf[gdf.geometry.area > nth_percentile].reset_index(drop=True)
 
     return gdf
+
+
+def merge_thin_into_neighbors(
+    gdf: gpd.GeoDataFrame,
+    min_width: float = 20,
+    area_retention: float = 0.15,
+    max_iter: int = 8,
+) -> gpd.GeoDataFrame:
+    """Absorb shapes that are too thin to paint into their largest-border neighbor.
+
+    Rather than dropping thin shapes (which leaves blank gaps), this function
+    reassigns each thin shape's area to the adjacent thick shape it shares the
+    most border with.  The iteration continues until no thin shapes remain or
+    max_iter is reached — this naturally handles clusters of thin shapes that
+    only border each other: as each is absorbed, the thick shapes grow until
+    they reach the remaining isolated thin ones.
+
+    Thin criteria (same as the old remove_thin_shapes):
+      1. Erodes to empty — no cross-section wider than min_width.
+      2. Area retention < area_retention after inward erosion of min_width/2.
+    """
+    for iteration in range(max_iter):
+        erosion = min_width / 2
+        eroded = gdf.geometry.buffer(-erosion)
+        original_area = gdf.geometry.area
+
+        is_empty = eroded.is_empty
+        retention = eroded.area / original_area.clip(lower=1e-6)
+        is_thin = is_empty | (retention < area_retention)
+
+        n_thin = is_thin.sum()
+        if n_thin == 0:
+            break
+
+        print(f"Iter {iteration + 1}: absorbing {n_thin} thin shapes into neighbors")
+
+        thin_gdf = gdf[is_thin].reset_index(drop=True)
+        thick_gdf = gdf[~is_thin].reset_index(drop=True)
+
+        if len(thick_gdf) == 0:
+            # All shapes are thin — nothing to absorb into, stop
+            break
+
+        # Work on mutable geometry list for thick shapes
+        thick_geoms = list(thick_gdf.geometry)
+
+        # Process thin shapes largest-first so big thin shapes get absorbed first,
+        # then smaller ones can find newly-enlarged thick neighbors
+        thin_order = thin_gdf.geometry.area.sort_values(ascending=False).index
+
+        for thin_idx in thin_order:
+            thin_geom = thin_gdf.geometry.iloc[thin_idx]
+            # Buffer slightly to reliably detect touching/adjacent shapes
+            thin_probe = thin_geom.buffer(1.5)
+
+            best_pos = None
+            best_border = 0
+            for thick_pos, thick_geom in enumerate(thick_geoms):
+                if not thin_probe.intersects(thick_geom):
+                    continue
+                shared = thin_probe.intersection(thick_geom)
+                border_len = shared.length if not shared.is_empty else 0
+                if border_len > best_border:
+                    best_border = border_len
+                    best_pos = thick_pos
+
+            if best_pos is not None:
+                thick_geoms[best_pos] = thick_geoms[best_pos].union(thin_geom)
+
+        thick_gdf = thick_gdf.copy()
+        thick_gdf["geometry"] = thick_geoms
+
+        # Re-dissolve adjacent same-color shapes that are now touching after absorption
+        gdf = (
+            thick_gdf.dissolve(by="color_index", as_index=False)
+            .explode(index_parts=False)
+            .reset_index(drop=True)
+        )
+
+    return gdf
+
+
+def split_large_shapes(
+    gdf: gpd.GeoDataFrame, max_area: float = 8000
+) -> gpd.GeoDataFrame:
+    """Split polygons larger than max_area into grid cells of roughly that size.
+
+    A regular grid is intersected with each oversized polygon.  The cell size is
+    chosen so each resulting piece is close to max_area, which keeps both painting
+    sections and label placement manageable.  Thin/long shapes naturally become
+    a series of shorter, labellable segments.
+    """
+    from shapely.geometry import box
+
+    cell_size = max_area**0.5  # target cell width ≈ height
+
+    rows = []
+    for _, row in tqdm(gdf.iterrows(), total=len(gdf), desc="Splitting large shapes"):
+        geom = row.geometry
+        if geom.area <= max_area:
+            rows.append(row)
+            continue
+
+        minx, miny, maxx, maxy = geom.bounds
+        for x0 in np.arange(minx, maxx, cell_size):
+            for y0 in np.arange(miny, maxy, cell_size):
+                cell = box(x0, y0, x0 + cell_size, y0 + cell_size)
+                piece = geom.intersection(cell)
+                if piece.is_empty or piece.area < 1:
+                    continue
+                new_row = row.copy()
+                new_row["geometry"] = piece
+                rows.append(new_row)
+
+    return gpd.GeoDataFrame(rows, crs=gdf.crs).reset_index(drop=True)
 
 
 def smooth_image(image: Image, iter=3) -> Image:
@@ -327,7 +442,7 @@ def render_paint_by_number(
         geom = row.geometry
         area = geom.area
         label = str(row["color_index"])
-        font_size = max(2, min(6, area**0.3))
+        font_size = max(6, min(14, area**0.35))
 
         if area > label_spacing * label_spacing:
             # Large polygon: place grid labels avoiding sub-shapes
@@ -405,10 +520,10 @@ def main():
     # parse the arguments
     args = parser.parse_args()
 
-    image = open_image("data/appa_flying.jpg")
-    available_colors = get_available_colors(image, 15)
+    image = open_image("data/snowman2.jpg")
+    available_colors = get_available_colors(image, 8)
     image = smooth_image(
-        image, 4
+        image, 8
     )  # Helpful when there are very fine details; Can I programatically identify?
     pixel_to_color_dict = map_real_colors_to_available_colors(image, available_colors)
     image_adj = convert_image_to_available_colors(image, pixel_to_color_dict)
@@ -417,6 +532,7 @@ def main():
     image_adj_new.save("image_adj.png")
     image_adj_gdf = convert_image_to_shapes(image_adj_new, available_colors)
     image_adj_gdf = clean_shapes(image_adj_gdf.copy())
+    image_adj_gdf = merge_thin_into_neighbors(image_adj_gdf, min_width=8)
 
     # Write to geojson
     image_adj_gdf.reset_index(drop=True).to_file(
