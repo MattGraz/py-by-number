@@ -214,20 +214,22 @@ def clean_shapes(gdf, percentile_threshhold=0.65, drop_duplicates=True):
     gdf["geometry"] = gdf["geometry"].buffer(0)
 
     if drop_duplicates:
-        # Identify and Drop duplicate shapes (may have different colors)
-        #   Just randomly pick one to drop for now
-        # TODO: Why/How do these duplicate shapes get created?
-        for row_iter in tqdm(gdf.iterrows(), total=gdf.shape[0]):
-            shape_iter = row_iter[1].geometry
-            color_iter = row_iter[1].color_index
+        # Hash geometry as WKB for O(n) duplicate detection instead of O(n²) pairwise comparison
+        gdf["_wkb"] = gdf.geometry.apply(lambda g: g.wkb)
+        gdf = gdf.drop_duplicates(subset="_wkb", keep="first")
+        gdf = gdf.drop(columns="_wkb")
 
-            equal_shapes = gdf[gdf.geometry == shape_iter]
+    # Merge same-color shapes into one geometry (handles nesting and adjacency)
+    # This eliminates redundant inner/outer polygons of the same color
+    gdf = gdf.dissolve(by="color_index", as_index=False)
 
-            if equal_shapes.shape[0] > 1:
-                print("Dropping")
-                gdf = gdf[
-                    ~((gdf.geometry == shape_iter) & (gdf.color_index == color_iter))
-                ]
+    # Dissolve can produce MultiPolygons when the same color appears in disconnected
+    # regions. Explode them back into individual parts so each part can be labeled.
+    gdf = gdf.explode(index_parts=False).reset_index(drop=True)
+
+    # Drop any small fragments that appeared after dissolve+explode
+    nth_percentile = gdf.geometry.area.quantile(percentile_threshhold)
+    gdf = gdf[gdf.geometry.area > nth_percentile].reset_index(drop=True)
 
     return gdf
 
@@ -248,19 +250,87 @@ def render_paint_by_number(
     gdf.plot(ax=ax, facecolor="white", edgecolor="black", linewidth=0.3)
 
     # Place color_index labels inside each polygon
-    # For large shapes, scatter multiple labels so the number is always nearby
+    # Rules:
+    #   1. Every shape MUST have at least one label
+    #   2. Large shapes get additional grid labels for readability
+    #   3. Grid labels must not fall inside any other (sub-)shape
+    #   4. Prefer non-overlapping positions; fall back to best available
     from shapely.geometry import Point
+    from shapely.strtree import STRtree
 
     label_spacing = 40  # pixels between repeated labels in large shapes
+    min_label_dist = 12  # minimum distance between any two labels
+    placed_positions = []
 
-    for _, row in gdf.iterrows():
+    def min_dist_to_placed(x, y):
+        if not placed_positions:
+            return float("inf")
+        return min((x - px) ** 2 + (y - py) ** 2 for px, py in placed_positions) ** 0.5
+
+    def can_place(x, y):
+        return min_dist_to_placed(x, y) >= min_label_dist
+
+    def is_inside_other(pt, own_geom, tree, all_geoms):
+        """Return True if pt is inside any geometry other than own_geom."""
+        for i in tree.query(pt):
+            candidate = all_geoms[i]
+            if candidate is not own_geom and candidate.contains(pt):
+                return True
+        return False
+
+    def find_label_pos(geom, own_geom_ref, tree, all_geoms, sample=6):
+        """Find the best interior point that avoids other shapes and existing labels.
+        Returns (x, y, is_clear) where is_clear=False means overlap was unavoidable."""
+        rp = geom.representative_point()
+
+        # Try representative point first
+        if can_place(rp.x, rp.y) and not is_inside_other(
+            rp, own_geom_ref, tree, all_geoms
+        ):
+            return rp.x, rp.y, True
+
+        # Sample a grid of interior candidate points
+        minx, miny, maxx, maxy = geom.bounds
+        step_x = (maxx - minx) / (sample + 1)
+        step_y = (maxy - miny) / (sample + 1)
+        best_x, best_y = rp.x, rp.y
+        best_dist = -1
+        for i in range(1, sample + 1):
+            for j in range(1, sample + 1):
+                x = minx + i * step_x
+                y = miny + j * step_y
+                pt = Point(x, y)
+                if not geom.contains(pt):
+                    continue
+                if is_inside_other(pt, own_geom_ref, tree, all_geoms):
+                    continue
+                if can_place(x, y):
+                    return x, y, True
+                # Track best fallback: point farthest from existing labels
+                d = min_dist_to_placed(x, y)
+                if d > best_dist:
+                    best_dist = d
+                    best_x, best_y = x, y
+
+        return best_x, best_y, False
+
+    # Sort by area ascending: small shapes get labeled first
+    gdf["_area"] = gdf.geometry.area
+    gdf_sorted = gdf.sort_values(by="_area", ascending=True)
+    gdf = gdf.drop(columns="_area")
+
+    # Build spatial index of ALL geometries for sub-shape checking
+    all_geoms = list(gdf.geometry)
+    tree = STRtree(all_geoms)
+
+    for idx, row in gdf_sorted.iterrows():
         geom = row.geometry
         area = geom.area
         label = str(row["color_index"])
         font_size = max(2, min(6, area**0.3))
 
         if area > label_spacing * label_spacing:
-            # Large polygon: place labels on a grid within the shape
+            # Large polygon: place grid labels avoiding sub-shapes
             minx, miny, maxx, maxy = geom.bounds
             x_pts = np.arange(minx + label_spacing / 2, maxx, label_spacing)
             y_pts = np.arange(miny + label_spacing / 2, maxy, label_spacing)
@@ -268,7 +338,9 @@ def render_paint_by_number(
             for x in x_pts:
                 for y in y_pts:
                     pt = Point(x, y)
-                    if geom.contains(pt):
+                    if not geom.contains(pt) or not can_place(x, y):
+                        continue
+                    if not is_inside_other(pt, geom, tree, all_geoms):
                         ax.text(
                             x,
                             y,
@@ -278,31 +350,28 @@ def render_paint_by_number(
                             fontsize=font_size,
                             color="black",
                         )
+                        placed_positions.append((x, y))
                         placed = True
-            # Fallback if grid missed the shape (thin/odd geometry)
+            # Guarantee at least one label per shape
             if not placed:
-                rp = geom.representative_point()
+                x, y, _ = find_label_pos(geom, geom, tree, all_geoms)
                 ax.text(
-                    rp.x,
-                    rp.y,
+                    x,
+                    y,
                     label,
                     ha="center",
                     va="center",
                     fontsize=font_size,
                     color="black",
                 )
+                placed_positions.append((x, y))
         else:
-            # Small polygon: single label
-            rp = geom.representative_point()
+            # Small/medium polygon: find best non-overlapping interior point
+            x, y, _ = find_label_pos(geom, geom, tree, all_geoms)
             ax.text(
-                rp.x,
-                rp.y,
-                label,
-                ha="center",
-                va="center",
-                fontsize=font_size,
-                color="black",
+                x, y, label, ha="center", va="center", fontsize=font_size, color="black"
             )
+            placed_positions.append((x, y))
 
     ax.set_aspect("equal")
     ax.axis("off")
@@ -336,7 +405,7 @@ def main():
     # parse the arguments
     args = parser.parse_args()
 
-    image = open_image("data/yosemite_small.png")
+    image = open_image("data/appa_flying.jpg")
     available_colors = get_available_colors(image, 15)
     image = smooth_image(
         image, 4
