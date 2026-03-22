@@ -373,8 +373,11 @@ def render_paint_by_number(
     from shapely.geometry import Point
     from shapely.strtree import STRtree
 
-    label_spacing = 40  # pixels between repeated labels in large shapes
-    min_label_dist = 12  # minimum distance between any two labels
+    # Scale label density to image size so labels don't overwhelm large images
+    bounds = gdf.geometry.total_bounds  # [minx, miny, maxx, maxy]
+    image_extent = max(bounds[2] - bounds[0], bounds[3] - bounds[1])
+    label_spacing = max(60, image_extent / 7)  # ~7 labels across the largest dimension
+    min_label_dist = label_spacing * 0.4  # no two labels closer than 40% of spacing
     placed_positions = []
 
     def min_dist_to_placed(x, y):
@@ -500,6 +503,40 @@ def render_paint_by_number(
     print(f"Paint-by-number saved to {output_path}")
 
 
+def render_colored_result(
+    gdf: gpd.GeoDataFrame, output_path: str = "image_colored.png", dpi: int = 200
+):
+    """Render the cleaned shapes filled with their actual colors.
+
+    Lets you visually verify what the final painted result will look like
+    after all shape cleaning and thin-shape merging has been applied.
+    """
+    import re
+
+    def parse_color(color_name: str):
+        # Handles numpy repr "np.int64(255)" and plain Python repr "255"
+        nums = re.findall(
+            r"\((\d+)\)", color_name
+        )  # numpy format: grab value inside ()
+        if not nums:
+            nums = re.findall(r"\d+", color_name)  # plain int format
+        return tuple(int(x) / 255.0 for x in nums[:3])
+
+    _, ax = plt.subplots(1, 1, figsize=(16, 12))
+
+    colors = [parse_color(row["color_name"]) for _, row in gdf.iterrows()]
+    gdf.plot(ax=ax, color=colors, edgecolor="none")
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.invert_yaxis()
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    print(f"Colored result saved to {output_path}")
+
+
 def main():
 
     # create parser
@@ -520,8 +557,8 @@ def main():
     # parse the arguments
     args = parser.parse_args()
 
-    image = open_image("data/snowman2.jpg")
-    available_colors = get_available_colors(image, 8)
+    image = open_image(args.input_path)
+    available_colors = get_available_colors(image, 10)
     image = smooth_image(
         image, 8
     )  # Helpful when there are very fine details; Can I programatically identify?
@@ -534,10 +571,20 @@ def main():
     image_adj_gdf = clean_shapes(image_adj_gdf.copy())
     image_adj_gdf = merge_thin_into_neighbors(image_adj_gdf, min_width=8)
 
-    # Write to geojson
-    image_adj_gdf.reset_index(drop=True).to_file(
-        "test_geopandas.geojson", driver="GeoJSON"
-    )
+    # Remove shapes too small to physically paint (< ~7x7 pixels)
+    min_paintable_area = 50
+    n_before = len(image_adj_gdf)
+    image_adj_gdf = image_adj_gdf[
+        image_adj_gdf.geometry.area >= min_paintable_area
+    ].reset_index(drop=True)
+    n_removed = n_before - len(image_adj_gdf)
+    if n_removed:
+        print(
+            f"Removed {n_removed} unpaintable shapes (area < {min_paintable_area}px²)"
+        )
+
+    # Render colored preview (what the finished painting will look like)
+    render_colored_result(image_adj_gdf, "image_colored.png")
 
     # Render paint-by-number image with labeled shapes
     render_paint_by_number(image_adj_gdf, args.output_path)
